@@ -1,8 +1,12 @@
 # Alienware m18 – Adaptive Fan Whisperer (v2)
 
-Welcome to the unofficial thermal rebellion for Dell’s Alienware m18 and friends. This is not a flashy RGB controller. This is a disciplined little Python daemon that outsmarts proprietary firmware using the only lever Dell left unlocked: **`/sys/firmware/acpi/platform_profile`**.
+Welcome to the unofficial thermal rebellion for Dell’s Alienware m18 and friends.
+This is not a flashy RGB controller. 
+This is a disciplined little Python daemon that outsmarts proprietary firmware using the only lever Dell left unlocked:
+**`/sys/firmware/acpi/platform_profile`**.
 
-You can’t set fan RPMs directly on these machines (thanks SMM lockout), but you can *nudge* the firmware into doing your bidding. This tool pulses the “performance” profile at just the right moments to keep your system cool without sounding like a leaf blower.
+You can’t set fan RPMs directly on these machines (thanks SMM lockout), but you can *nudge* the firmware into doing your bidding. 
+This tool pulses the “performance” profile at just the right moments to keep your system cool without sounding like a leaf blower.
 
 Crafted by a human who actually lives with this laptop, and co-developed by an AI who’s learned to speak both ACPI and sarcasm.
 
@@ -10,58 +14,62 @@ Crafted by a human who actually lives with this laptop, and co-developed by an A
 
 ## 🧭 Why This Exists
 
-Let’s be blunt.
-
-Dell hides fan control behind a proprietary System Management Mode (SMM) interface. On Linux, you can read sensors just fine. But writing fan speeds? Nope. Kernel modules? Blocked. EC access? Laughed out of the room. SMBIOS? Dead end.
+Dell hides fan control behind a proprietary System Management Mode (SMM) interface. 
+On Linux, you can read sensors just fine. 
+But writing fan speeds? Nope. Kernel modules? Blocked. EC access? Laughed out of the room. SMBIOS? Dead end.
 
 What’s left is a single ACPI control node:
 
-* `platform_profile = performance` → fans ramp hard (\~80–100 %)
-* `platform_profile = balanced` → fans eventually idle (but often too late)
+* `platform_profile = performance` → fans ramp hard (\~80–100 %)
+* `platform_profile = balanced` → fans eventually idle (but often when its about to melt)
 
 This daemon *flips that switch on and off intelligently*, based on:
 
 * Real sensor data
 * Calculated temperature trends (with timestamps)
-* Custom zones (CPU/GPU/ambient/memory)
+* Custom zones extrapolated from the `hwmon` (CPU/GPU/ambient/memory)
 * Hysteresis and cooldown logic
-* Emergency debounce for real spikes (not flukes)
+* Emergency debounce for real spikes (not flukes [TODO] there is an improvement to be made here])
 
 ---
 
 ## 🛠️ Features
 
-| Feature                      | Why It Matters                                        |
-| ---------------------------- | ----------------------------------------------------- |
-| **ACPI Pulse Control**       | Uses Dell’s own knobs against it                      |
-| **Thermal Zones**            | Separates CPU/GPU/Memory/Ambient with per-zone tuning |
-| **Trend-Aware Cadence**      | Doesn’t just react to heat — it predicts it           |
-| **Emergency Debounce**       | Prevents panic toggles on one-off spikes              |
-| **Global Fan Sanity Check**  | Detects stalled fans or sensors                       |
-| **Hysteresis, Not Hysteria** | Avoids flapping between states                        |
-| **Zero Dependencies**        | Pure Python, no `i8k` hacks, no kernel voodoo         |
+| Feature                      | Why It Matters                                           |
+| ---------------------------- |----------------------------------------------------------|
+| **ACPI Pulse Control**       | Uses Dell’s own knobs against it                         |
+| **Thermal Zones**            | Separates CPU/GPU/Memory/Ambient with per-zone tuning    |
+| **Trend-Aware Cadence**      | Doesn’t just react to heat — it predicts it              |
+| **Emergency Debounce**       | Prevents panic toggles on one-off spikes                 |
+| **Global Fan Sanity Check**  | Detects stalled fans or sensors                          |
+| **Hysteresis, Not Hysteria** | Avoids flapping between states                           |
+| **Zero Dependencies**        | Pure Python, no `i8k` hacks, no kernel voodoo, just acpi |
 
 ---
 
 ## 🧬 Design Philosophy
 
-> Stop fighting firmware. Start orchestrating it.
+> Don't fight it, just go with it.
 
-After a wasted month trying to reverse-engineer Dell’s Embedded Controller (EC), patching `i8k`, and spelunking through ACPI tables… the real insight came:
+After days wasted trying to reverse-engineer Dell’s Embedded Controller (EC), trying to patch `i8k`, 
+and spelunking through ACPI tables and BIOS hell... the real insight came:
 
-**Let the firmware do its job — just do a better job of telling it when.**
+Performance mode causes full the fan to blast into orbit. Works but will make a baby cry. 
+Pulse it and we have a crutch for the BIOS's thermal amnesia - and! my wife doesn’t think we’re leaving the atmosphere.
 
-This daemon reads every thermal sensor on `/sys/class/hwmon`, buckets them by purpose, and builds a real-time model of how fast temps are rising and how close we are to the danger zone. Then it toggles profiles accordingly — no more, no less.
+This daemon reads every thermal sensor on `/sys/class/hwmon`, buckets them by zone, 
+and builds a real-time heuristic of how fast temps are rising and how close we are to the danger zone. 
+Then it toggles profiles in a slightly dumb way - more on this in the Cadence Algorithm.
 
-You could say it’s fan control by proxy. We prefer: **DharmaOS meets firmware aikido**.
+You could say it’s fan control by proxy - **My Satyanet meets firmware aikido**.
 
 ---
 
 ## 📦 Requirements
 
-* Linux kernel **5.17+**
-* Python **3.8+**
-* Root access (to write to ACPI node)
+* Linux kernel **5.17+** (or so says ChatGPT)
+* Python **3.8+** (I tested with 3.13.3)
+* Root access to write to ACPI node. [TODO] Space to improve without root perhaps. 
 * A laptop that supports `/sys/firmware/acpi/platform_profile` (Alienware m18 confirmed)
 
 ---
@@ -103,21 +111,31 @@ ZoneConfig(
 )
 ```
 
-You can fine-tune thresholds per zone. Want memory to chill harder? Drop its trigger temp. Want less fan toggling? Increase the `release`.
+You can fine-tune thresholds per zone. Want memory to chill harder? Drop its trigger temp. Want less fan blasting? Increase the `release`.
 
-Global tunables:
+Other Tune-able parameters:
 
 ```python
-CRITICAL_TEMP = 95         # °C emergency lock
-TREND_SENSITIVITY = 0.3    # Higher = more reactive
+ACPI_PROFILE_PATH = "/sys/firmware/acpi/platform_profile"
+LOG_FILE = "/var/log/alienware_fancontrol.log"
+POLL_INTERVAL = 1  # seconds between sensor sweeps
+LOG_INTERVAL = 10  # seconds between log lines
+INITIAL_BOOST = 5  # seconds – keep profile=performance after boot
+CRITICAL_TEMP = 95  # °C – emergency profile lock
+HISTORY_WINDOW = 30  # seconds for moving average calculation
+TREND_SENSITIVITY = 0.3  # how aggressively we adjust cadence (0-1)
+EMERGENCY_DEBOUNCE = 3  # consecutive seconds above critical temp
+
+# See next section to learn why this is unimportant for now
 BASE_CADENCE = {
     0: {"on": 0, "off": 9999},  # Cool zone
     1: {"on": 1, "off": 14},    # Warm zone
     2: {"on": 4, "off": 8},     # Hot zone
 }
-```
 
-Want to trigger earlier? Drop `trigger`. Want to pulse less? Increase `off`.
+# Zone importance weights for trend calculation
+ZONE_WEIGHTS = {"cpu": 1.0, "gpu": 1.0, "memory": 0.6, "ambient": 0.4}
+```
 
 ---
 
@@ -138,12 +156,14 @@ Each tick (1s):
 Cadence dynamically adapts to both temperature *and* the rate of change.
 
 ###  Smart Cadence Right? Yeah… But About That
-Right now, we say we pulse for on/off durations… but actually, we recalculate cadence every tick - mid-pulse overrides always happen, breaking the spirit of duration-based control. 
+Right now, we say we pulse for on/off durations… but actually, we recalculate cadence every tick -
+mid-pulse overrides always happen, breaking the spirit of duration-based control. 
 
-The trend logic is solid — slope, proximity, all of it — but it’s being applied too frequently so the regression is not quite learning a trend. 
-The right fix? Let the system commit and ride out the cadence, then reassess — just like a good feedback loop should. 
+The trend logic is solid — slope, proximity, all of it — the regression is learning a trend but it’s overridden by the base interval too frequently.
 
-We’ll get there. For now? This works well enough, and I’ve got bigger dragons to slay. l33t!
+[TODO] Let the system commit and ride out the cadence, then reassess. The general time to ramp fan rpm to max is about 10s, and drop to 0 happens in about 15. We could use these bounds to come up with a better pulser (is that a word?)
+
+We’ll get there. For now? For now, this works well enough, and I’ve got bigger dragons to slay. l33t code, here I come!!
 
 ---
 
@@ -156,7 +176,9 @@ If any zone hits 95°C for 3+ consecutive seconds, the daemon:
 * Waits for temps to drop before resuming
 
 False positives avoided. Actual emergencies handled.
-
+ish
+[TOOD] we do hit the crit temp. Currently the monitors read a temp for every CPU. I suspect when a CPU gets a high load, it spikes temp before its balanced. This micro spike on the sensor can come through. 
+Right now we are taking max but perhaps this is where we want moving avg or a smarter aggregator.
 ---
 
 ## 🔁 Systemd Setup
@@ -184,7 +206,6 @@ Then:
 ```bash
 sudo systemctl daemon-reload
 sudo systemctl enable --now autofan
-sudo journalctl -u autofan -f
 ```
 
 ---
@@ -194,9 +215,10 @@ sudo journalctl -u autofan -f
 Tools to help:
 
 ```bash
-sensors -j
+watch sensors 
 watch -n1 "cat /sys/firmware/acpi/platform_profile"
 journalctl -u autofan -f
+# if you want more tools to port to your device - reach out. I push my custom temperature and fan monitors that started this whole shebang 
 ```
 
 
@@ -215,11 +237,11 @@ Common tweaks:
 
 ## 🙏 Acknowledgements
 
-Created by **Nikunj Sura** (and sweat, and thermals, and maybe divine frustration). Co-developed and structured by **Deepseek** & **ChatGPT**, who finally stopped suggesting `i8kutils`.
+Created with sweat, blasting fans, melting laptops, and maybe divine will. Co-developed and structured by **Deepseek** who wrote a lot of code & **ChatGPT**, who finally stopped suggesting `i8kutils` and perhaps a little guidance from an ADHD human.
 
-This tool is part of a broader journey toward **SatyaNet** and **DharmaOS** — where systems serve truth, not just telemetry.
+This tool is part of a broader journey toward completing my **SatyaNet** projects.
 
-If you found this helpful, confusing, or delightfully hacky — you're welcome.
+`SatyaNet` like skynet but serves Truth instead of the AI overloads
 
 ---
 
