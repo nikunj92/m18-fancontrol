@@ -137,6 +137,14 @@ Each tick (1s):
 
 Cadence dynamically adapts to both temperature *and* the rate of change.
 
+###  Smart Cadence Right? Yeah… But About That
+Right now, we say we pulse for on/off durations… but actually, we recalculate cadence every tick - mid-pulse overrides always happen, breaking the spirit of duration-based control. 
+
+The trend logic is solid — slope, proximity, all of it — but it’s being applied too frequently so the regression is not quite learning a trend. 
+The right fix? Let the system commit and ride out the cadence, then reassess — just like a good feedback loop should. 
+
+We’ll get there. For now? This works well enough, and I’ve got bigger dragons to slay. l33t!
+
 ---
 
 ## 🪓 Emergency Mode
