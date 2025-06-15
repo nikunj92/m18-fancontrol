@@ -1,13 +1,5 @@
 #!/usr/bin/env python3
 """Autofan Control Daemon with Enhanced Adaptive Cadence
-
-Improved version with:
-- Time-corrected linear regression
-- Weighted zone trends
-- Cadence recomputation each tick
-- Distance-to-trigger hotness factor
-- Global fan RPM monitoring
-- Debounced emergency handling
 """
 
 import glob
@@ -23,37 +15,56 @@ from typing import Dict, List, Tuple, Deque
 # Configuration
 ###############################################################################
 
+# Path to ACPI profile sysfs node (must be writable by root)
 ACPI_PROFILE_PATH = "/sys/firmware/acpi/platform_profile"
+# Log file for daemon output
 LOG_FILE = "/var/log/alienware_fancontrol.log"
-POLL_INTERVAL = 1  # seconds between sensor sweeps
-LOG_INTERVAL = 10  # seconds between log lines
-INITIAL_BOOST = 5  # seconds – keep profile=performance after boot
-CRITICAL_TEMP = 95  # °C – emergency profile lock
-HISTORY_WINDOW = 30  # seconds for moving average calculation
-TREND_SENSITIVITY = 0.3  # how aggressively we adjust cadence (0-1)
-EMERGENCY_DEBOUNCE = 3  # consecutive seconds above critical temp
+# How often to poll sensors (seconds)
+POLL_INTERVAL = 1
+# How often to write a log line (seconds)
+LOG_INTERVAL = 10
+# On boot, keep performance mode for this many seconds
+INITIAL_BOOST = 5
+# Emergency: if any zone exceeds this temp (°C), lock performance
+CRITICAL_TEMP = 95
+# Number of seconds to keep temperature history for trend calculation
+HISTORY_WINDOW = 30
+# How aggressively to adjust cadence based on trend (0-1)
+TREND_SENSITIVITY = 0.3
+# How many consecutive seconds above CRITICAL_TEMP before emergency triggers
+EMERGENCY_DEBOUNCE = 3
 
-# Base cadence - these values will be adjusted dynamically
+# Base cadence for each severity level (will be dynamically adjusted)
 BASE_CADENCE: Dict[int, Dict[str, int]] = {
     0: {"on": 0, "off": 9999},  # Cool – stay balanced indefinitely
-    1: {"on": 1, "off": 30},  # Warm – short pulses every ~15 s
-    2: {"on": 4, "off": 12},  # Hot  – longer pulses, shorter rests
+    1: {"on": 1, "off": 30},    # Warm – short pulses every ~15 s
+    2: {"on": 4, "off": 12},    # Hot  – longer pulses, shorter rests
 }
 
-# Zone importance weights for trend calculation
+# Importance weights for each zone when calculating global trend
 ZONE_WEIGHTS = {"cpu": 1.0, "gpu": 1.0, "memory": 0.6, "ambient": 0.4}
 
 
 @dataclass(frozen=True)
 class ZoneConfig:
-    """Configuration for a thermal zone."""
+    """Configuration for a thermal zone.
+
+    Each zone is defined by:
+    - name: logical name
+    - temp_regex: regexes to match temperature sensors
+    - fan_regex: regexes to match fan sensors
+    - trigger: temp above which zone is considered hot
+    - release: temp below which zone is considered cool
+    - min_rpm: minimum expected fan RPM (for sanity check)
+    - max_rpm: observed maximum RPM (for logging/analysis)
+    """
     name: str
     temp_regex: List[str]
     fan_regex: List[str]
-    trigger: int  # °C above which zone is considered hot
-    release: int  # °C below which zone is considered cool
-    min_rpm: int  # treat fan RPM below this as too low
-    max_rpm: int  # observed maximum – only for logging/analysis
+    trigger: int
+    release: int
+    min_rpm: int
+    max_rpm: int
 
     @property
     def high_rpm(self) -> int:
@@ -61,7 +72,7 @@ class ZoneConfig:
         return int(self.max_rpm * 0.85)
 
 
-# Zone configuration table
+# List of all thermal zones to monitor
 ZONES: Tuple[ZoneConfig, ...] = (
     ZoneConfig(
         name="cpu",
@@ -107,17 +118,21 @@ ZONES: Tuple[ZoneConfig, ...] = (
 ###############################################################################
 
 class SensorReader:
-    """Reads temperature and fan data from hardware sensors"""
+    """Reads temperature and fan data from hardware sensors.
+
+    Scans /sys/class/hwmon for all available sensors, matches them to zones
+    using regexes, and aggregates the maximum value per zone.
+    """
 
     @staticmethod
     def _matches_any(regexes: List[str], text: str) -> bool:
-        """Case-insensitive search against regex patterns"""
+        """Case-insensitive search against regex patterns."""
         return any(re.search(pattern, text, re.IGNORECASE) for pattern in regexes)
 
     @staticmethod
     def read() -> Tuple[Dict[str, float], Dict[str, int]]:
         """
-        Gather temperatures (°C) and fan RPMs from /sys/class/hwmon
+        Gather temperatures (°C) and fan RPMs from /sys/class/hwmon.
 
         Returns:
             temps: Maximum temperature per zone
@@ -149,7 +164,7 @@ class SensorReader:
     def _process_sensor(cls, entry: str, sensor_path: str, device: str,
                         temps: Dict[str, List[float]],
                         fans: Dict[str, List[int]]):
-        """Process individual sensor entries"""
+        """Process individual sensor entries and assign to temp or fan."""
         # Temperature sensors
         if entry.startswith("temp") and entry.endswith("_input"):
             cls._process_temp_sensor(entry, sensor_path, device, temps)
@@ -160,7 +175,7 @@ class SensorReader:
     @classmethod
     def _process_temp_sensor(cls, entry: str, sensor_path: str, device: str,
                              temps: Dict[str, List[float]]):
-        """Process temperature sensor input"""
+        """Process temperature sensor input and assign to zone."""
         try:
             with open(sensor_path) as f:
                 value = int(f.read().strip()) / 1000.0  # millideg → °C
@@ -183,7 +198,7 @@ class SensorReader:
     @classmethod
     def _process_fan_sensor(cls, entry: str, sensor_path: str, device: str,
                             fans: Dict[str, List[int]]):
-        """Process fan sensor input"""
+        """Process fan sensor input and assign to zone."""
         try:
             with open(sensor_path) as f:
                 rpm = int(f.read().strip())
@@ -209,7 +224,7 @@ class SensorReader:
     @classmethod
     def _assign_to_zone(cls, key: str, value: float,
                         data: Dict[str, List[float]], is_temp: bool):
-        """Assign sensor reading to appropriate zone"""
+        """Assign sensor reading to appropriate zone based on regex match."""
         for zone in ZONES:
             regex_list = zone.temp_regex if is_temp else zone.fan_regex
             if cls._matches_any(regex_list, key):
@@ -222,7 +237,11 @@ class SensorReader:
 ###############################################################################
 
 class ThermalAnalyzer:
-    """Analyzes thermal data and calculates trends with time correction"""
+    """Analyzes thermal data and calculates trends with time correction.
+
+    Maintains a moving window of temperature history for each zone, and
+    computes the trend (slope) using linear regression on timestamps.
+    """
 
     def __init__(self):
         # Store (timestamp, temperature) pairs for accurate regression
@@ -231,7 +250,7 @@ class ThermalAnalyzer:
         }
 
     def update_history(self, temps: Dict[str, float]):
-        """Update temperature history with current timestamp"""
+        """Update temperature history with current timestamp for each zone."""
         now = time.time()
         for zone in ZONES:
             if temp := temps.get(zone.name):
@@ -239,8 +258,11 @@ class ThermalAnalyzer:
 
     def calculate_trend(self, zone_name: str) -> float:
         """
-        Calculate temperature trend for a zone (-1 to 1)
-        Uses actual timestamps for accurate regression
+        Calculate temperature trend for a zone (-1 to 1).
+        Uses actual timestamps for accurate regression.
+
+        Returns:
+            Normalized slope in range [-1, 1].
         """
         history = self.temp_history[zone_name]
         if len(history) < 2:
@@ -277,7 +299,7 @@ class ThermalAnalyzer:
 
     @staticmethod
     def zone_severity(zone: ZoneConfig, temp: float) -> int:
-        """Determine thermal severity level (0-2) for a zone"""
+        """Determine thermal severity level (0-2) for a zone."""
         if temp >= zone.trigger:
             return 2
         if temp >= zone.release:
@@ -286,7 +308,7 @@ class ThermalAnalyzer:
 
     @staticmethod
     def fans_too_low(fans: Dict[str, int]) -> bool:
-        """Check if any fan is below minimum RPM (global check)"""
+        """Check if any fan is below minimum RPM (global check)."""
         if not fans:
             return False
         global_min = min(fans.values())
@@ -298,7 +320,13 @@ class ThermalAnalyzer:
 ###############################################################################
 
 class PulseController:
-    """Manages ACPI profile switching with enhanced adaptive cadence"""
+    """Manages ACPI profile switching with enhanced adaptive cadence.
+
+    Implements a state machine:
+    - INITIAL_BOOST: On boot, force performance mode for a few seconds.
+    - NORMAL: Pulse between performance and balanced based on thermal state.
+    - Handles emergency mode if critical temperature is reached.
+    """
 
     def __init__(self, analyzer: ThermalAnalyzer):
         self.state = "INITIAL_BOOST"
@@ -311,7 +339,16 @@ class PulseController:
         self.over_counter = 0  # For emergency debounce
 
     def tick(self, temps: Dict[str, float], fans: Dict[str, int]):
-        """Advance the controller state"""
+        """Advance the controller state by one tick.
+
+        Reads current temps/fans, updates history, checks for emergency,
+        computes cadence, and switches ACPI profile as needed.
+
+        [TODO] Let the system commit and ride out the cadence, then reassess.
+        Currently, cadence is recalculated every tick, so mid-pulse overrides
+        always happen, breaking the spirit of duration-based control.
+        See README for more details.
+        """
         now = time.time()
         elapsed = now - self.last_switch
 
@@ -340,7 +377,15 @@ class PulseController:
         self.log_status(now, temps, fans, global_sev, pulse_cfg)
 
     def handle_emergency(self, temps: Dict[str, float]):
-        """Handle critical temperature situation with debounce"""
+        """Handle critical temperature situation with debounce.
+
+        If any zone exceeds CRITICAL_TEMP for EMERGENCY_DEBOUNCE consecutive
+        ticks, lock performance mode until temps normalize.
+
+        [TODO] Emergency mode can be triggered by micro-spikes on a single
+        sensor (e.g., a single CPU core). Consider using a moving average or
+        smarter aggregation instead of max() to avoid false positives.
+        """
         critical = False
         for temp in temps.values():
             if temp >= CRITICAL_TEMP:
@@ -364,7 +409,7 @@ class PulseController:
             logging.warning("Temperature normalized, exiting emergency mode")
 
     def calculate_global_severity(self, temps: Dict[str, float]) -> int:
-        """Determine overall system thermal severity"""
+        """Determine overall system thermal severity (max of all zones)."""
         max_severity = 0
         for zone in ZONES:
             temp = temps.get(zone.name, 0)
@@ -374,7 +419,7 @@ class PulseController:
         return max_severity
 
     def _max_weighted_trend(self, temps: Dict[str, float]) -> float:
-        """Calculate maximum weighted trend across zones"""
+        """Calculate maximum weighted trend across all zones."""
         trends = []
         for zone in ZONES:
             if zone.name in temps:
@@ -384,7 +429,7 @@ class PulseController:
         return max(trends) if trends else 0.0
 
     def _compute_global_hot(self, temps: Dict[str, float]) -> float:
-        """Compute global hotness factor based on distance to triggers"""
+        """Compute global hotness factor based on distance to triggers."""
         global_hot = 0.0
         for zone in ZONES:
             temp = temps.get(zone.name, 0)
@@ -401,7 +446,7 @@ class PulseController:
         return global_hot
 
     def _cadence_for(self, sev: int, trend: float, global_hot: float) -> Dict[str, int]:
-        """Dynamically compute cadence based on severity, trend, and hotness"""
+        """Dynamically compute cadence based on severity, trend, and hotness."""
         # Start with base cadence
         cadence = BASE_CADENCE[sev].copy()
 
@@ -421,7 +466,10 @@ class PulseController:
 
     def handle_state_transition(self, now: float, elapsed: float,
                                 pulse_cfg: Dict[str, int], fans: Dict[str, int]):
-        """Manage state transitions based on current conditions"""
+        """Manage state transitions based on current conditions.
+
+        [TODO]currently, state transitions will override the intended pulse durations.
+        """
         if self.state == "INITIAL_BOOST":
             if elapsed >= INITIAL_BOOST:
                 self.set_profile("balanced")
@@ -437,7 +485,7 @@ class PulseController:
 
     def log_status(self, now: float, temps: Dict[str, float],
                    fans: Dict[str, int], global_sev: int, pulse_cfg: Dict[str, int]):
-        """Log system status periodically"""
+        """Log system status periodically (every LOG_INTERVAL seconds)."""
         if now - self.last_log < LOG_INTERVAL:
             return
 
@@ -462,7 +510,7 @@ class PulseController:
         )
 
     def set_profile(self, profile: str, force: bool = False):
-        """Switch to new ACPI profile if needed"""
+        """Switch to new ACPI profile if needed."""
         if force or self.current_profile != profile:
             self.current_profile = profile
             self.last_switch = time.time()
@@ -474,7 +522,10 @@ class PulseController:
 ###############################################################################
 
 def set_acpi_profile(profile: str) -> None:
-    """Write profile to ACPI platform profile sysfs node"""
+    """Write profile to ACPI platform profile sysfs node.
+
+    Requires root privileges.
+    """
     try:
         with open(ACPI_PROFILE_PATH, "w") as f:
             f.write(profile)
@@ -484,7 +535,9 @@ def set_acpi_profile(profile: str) -> None:
 
 
 def setup_logging():
-    """Configure logging system"""
+    """Configure logging system for both file and console output."""
+    # TODO - Use a rotating file handler to avoid log file bloat
+    # TODO - Consider logging only when there are changes to state or significant events. Currently we are debug logging.
     logging.basicConfig(
         level=logging.INFO,
         format='%(asctime)s [%(levelname)s] %(message)s',
@@ -502,7 +555,12 @@ def setup_logging():
 ###############################################################################
 
 def main() -> None:
-    """Main application entry point"""
+    """Main application entry point.
+
+    Requires root. Initializes analyzer and controller, then enters main loop.
+    Handles KeyboardInterrupt and fatal errors gracefully.
+    [TODO] Space to improve without root perhaps (see README).
+    """
     if os.geteuid() != 0:
         raise SystemExit("[ERR] Must be run as root.")
 
