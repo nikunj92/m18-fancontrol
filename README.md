@@ -77,9 +77,9 @@ You could say it’s fan control by proxy - **My Satyanet meets firmware aikido*
 ## 🚀 Quickstart
 
 ```bash
-git clone https://github.com/nikunj-sura/alienware-autofan.git
+git clone https://github.com/nikunj-sura/alienware-autofan.git # Or your repo URL
 cd alienware-autofan
-sudo ./autofan.py
+sudo python3 src/autofan.py
 ```
 
 That’s it. You’ll see logs like:
@@ -192,10 +192,15 @@ After=multi-user.target
 
 [Service]
 Type=simple
-ExecStart=/usr/bin/python3 /path/to/autofan.py
+# Adjust ExecStart to the correct path of your cloned repository
+ExecStart=/usr/bin/python3 /path/to/your/cloned/m18-fancontrol/src/autofan.py
+# Example: ExecStart=/usr/bin/python3 /opt/m18-fancontrol/src/autofan.py
+# You can also add --config /path/to/config.yaml if needed
 Restart=always
 RestartSec=1
 User=root
+# Consider setting WorkingDirectory if your script relies on relative paths for non-config files
+# WorkingDirectory=/path/to/your/cloned/m18-fancontrol/src/
 
 [Install]
 WantedBy=multi-user.target

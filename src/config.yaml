@@ -1,0 +1,54 @@
+acpi_profile_path: "/sys/firmware/acpi/platform_profile"
+log_file: "/var/log/alienware_fancontrol.log"
+poll_interval: 1
+log_interval: 10
+initial_boost: 5
+critical_temp: 95
+history_window: 30
+trend_sensitivity: 0.3
+emergency_debounce: 3
+
+base_cadence:
+  0: { on: 0, off: 9999 } # Cool – stay balanced indefinitely
+  1: { on: 1, off: 30 }    # Warm – short pulses
+  2: { on: 4, off: 12 }    # Hot  – longer pulses, shorter rests
+
+zone_weights:
+  cpu: 1.0
+  gpu: 1.0
+  memory: 0.6
+  ambient: 0.4
+
+# Configuration for each thermal zone
+# Adjust temp_regex and fan_regex to match your system's sensor names
+# Use 'watch sensors' or explore /sys/class/hwmon/hwmon*/name and /sys/class/hwmon/hwmon*/temp*_label (or *_input)
+zone_configs:
+  - name: "cpu"
+    temp_regex: [ "package", "core", "cpu" ]
+    fan_regex: [ "fan1", "cpu" ]
+    trigger: 75 # °C: Apply 'performance' profile
+    release: 68 # °C: Revert to 'balanced' profile
+    min_rpm: 300
+    max_rpm: 4200
+  - name: "gpu"
+    temp_regex: [ "gpu", "video" ] # Common GPU sensor names
+    fan_regex: [ "fan2", "gpu" ]
+    trigger: 72
+    release: 65
+    min_rpm: 300
+    max_rpm: 3900
+  - name: "memory"
+    temp_regex: [ r"sodimm", r"dimm", r"nvme" ]
+    fan_regex: [ r"fan4", r"memory" ]
+    trigger: 65
+    release: 60
+    min_rpm: 300
+    max_rpm: 6700
+  - name: "ambient"
+    temp_regex: [ "ambient", "iwlwifi" ]
+    fan_regex: [ "fan3", "chassis" ]
+    trigger: 55
+    release: 50
+    min_rpm: 300
+    max_rpm: 8900
+
